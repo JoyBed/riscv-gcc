@@ -94,21 +94,7 @@
 	(lshiftrt "lshr")])
 
 
-(define_insn "*st64_rvp"
-[(set (mem:DI (match_operand:SI 0 "register_operand" "=r"))
-(match_operand:DI 1 "register_operand" " r"))]
-"!TARGET_64BIT && TARGET_ZPSF"
-"st64\t%0,%1"
-[(set_attr "type" "store")
-(set_attr "mode" "DI")])
 
-(define_insn "*ld64_rvp"
-[(set (match_operand:DI          0 "register_operand" "=r")
-(mem:DI (match_operand:SI 1 "register_operand" " r")))]
-"!TARGET_64BIT && TARGET_ZPSF"
-"ld64\t%0,%1"
-[(set_attr "type" "load")
-(set_attr "mode" "DI")])
 ;; <rvp_insn> expands to the name of the insn that implements a particular code.
 (define_code_attr rvp_insn [(clrsb "clrs")
 	(clz "clz")
@@ -153,7 +139,43 @@
   [(set_attr "type" "arith")
    (set_attr "mode" "DI")])
 
+;; ld64
+(define_insn "*ld64_rvp"
+[(set (match_operand:DI          0 "register_operand" "=r")
+(mem:DI (plus:SI (match_operand:SI 1 "register_operand" " r")
+(match_operand:SI 2 "immediate_operand" " i"))))]
+"!TARGET_64BIT && TARGET_ZPSF"
+"ld64\t%0,%2(%1)"
+[(set_attr "type" "load")
+(set_attr "mode" "DI")])
 
+;;st64
+(define_insn "*st64_rvp"
+[(set (mem:DI (plus:SI (match_operand:SI 0 "register_operand" "=r")
+(match_operand:SI 1 "immediate_operand" " i")))
+(match_operand:DI 2 "register_operand" " r"))]
+"!TARGET_64BIT && TARGET_ZPSF"
+"st64\t%2,%1(%0)"
+[(set_attr "type" "store")
+(set_attr "mode" "DI")])
+
+;; ld64
+(define_insn "*ld64_rvp_base"
+[(set (match_operand:DI          0 "register_operand" "=r")
+(mem:DI (match_operand:SI 1 "register_operand" " r")))]
+"!TARGET_64BIT && TARGET_ZPSF"
+"ld64\t%0,%1"
+[(set_attr "type" "load")
+(set_attr "mode" "DI")])
+
+;;st64
+(define_insn "*st64_rvp_base"
+[(set (match_operand:DI          0 "register_operand" "=r")
+(mem:DI (match_operand:SI 1 "register_operand" " r")))]
+"!TARGET_64BIT && TARGET_ZPSF"
+"st64\t%0,%1"
+[(set_attr "type" "store")
+(set_attr "mode" "DI")])
 
 ;; rv64
 (define_insn "rvp_<uk>adddi3"

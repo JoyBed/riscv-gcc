@@ -1952,7 +1952,7 @@ riscv_subword (rtx op, bool high_p)
 bool
 riscv_split_64bit_move_p (rtx dest, rtx src)
 {
-  if (TARGET_64BIT)
+  if (TARGET_64BIT || TARGET_ZPSF)
     return false;
 
   /* Allow FPR <-> FPR and FPR <-> MEM moves, and permit the special case
@@ -1990,7 +1990,7 @@ riscv_split_doubleword_move (rtx dest, rtx src)
        riscv_emit_move (riscv_subword (dest, true), riscv_subword (src, true));
      }
 }
-
+
 /* Return the appropriate instructions to move SRC into DEST.  Assume
    that SRC is operand 1 and DEST is operand 0.  */
 
@@ -2014,14 +2014,21 @@ riscv_output_move (rtx dest, rtx src)
       if (src_code == REG && FP_REG_P (REGNO (src)))
 	return dbl_p ? "fmv.x.d\t%0,%1" : "fmv.x.w\t%0,%1";
 
-      if (src_code == MEM)
-	switch (GET_MODE_SIZE (mode))
-	  {
-	  case 1: return "lbu\t%0,%1";
-	  case 2: return "lhu\t%0,%1";
-	  case 4: return "lw\t%0,%1";
-	  case 8: return "ld\t%0,%1";
-	  }
+      if (src_code == MEM) {
+          if (!TARGET_64BIT && TARGET_ZPSF && GET_MODE_SIZE (mode) == 8)
+              return "ld64\t%0,%1";
+
+          switch (GET_MODE_SIZE(mode)) {
+              case 1:
+                  return "lbu\t%0,%1";
+              case 2:
+                  return "lhu\t%0,%1";
+              case 4:
+                  return "lw\t%0,%1";
+              case 8:
+                  return "ld\t%0,%1";
+          }
+      }
 
       if (src_code == CONST_INT)
 	return "li\t%0,%1";
@@ -2057,14 +2064,21 @@ riscv_output_move (rtx dest, rtx src)
 	      return "fcvt.d.w\t%0,x0";
 	    }
 	}
-      if (dest_code == MEM)
-	switch (GET_MODE_SIZE (mode))
-	  {
-	  case 1: return "sb\t%z1,%0";
-	  case 2: return "sh\t%z1,%0";
-	  case 4: return "sw\t%z1,%0";
-	  case 8: return "sd\t%z1,%0";
-	  }
+      if (dest_code == MEM) {
+          if (!TARGET_64BIT && TARGET_ZPSF && GET_MODE_SIZE (mode) == 8)
+              return "st64\t%0,%1";
+
+          switch (GET_MODE_SIZE(mode)) {
+              case 1:
+                  return "sb\t%z1,%0";
+              case 2:
+                  return "sh\t%z1,%0";
+              case 4:
+                  return "sw\t%z1,%0";
+              case 8:
+                  return "sd\t%z1,%0";
+          }
+      }
     }
   if (src_code == REG && FP_REG_P (REGNO (src)))
     {
