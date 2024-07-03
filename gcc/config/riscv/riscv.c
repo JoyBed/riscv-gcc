@@ -1,5 +1,5 @@
 /* Subroutines used for code generation for RISC-V.
-   Copyright (C) 2011-2020 Free Software Foundation, Inc.
+   Copyright (C) 2011-2021 Free Software Foundation, Inc.
    Contributed by Andrew Waterman (andrew@sifive.com).
    Based on MIPS target for GNU compiler.
 
@@ -891,17 +891,13 @@ riscv_compressed_lw_address_p (rtx x)
   bool result = riscv_classify_address (&addr, x, GET_MODE (x),
 					reload_completed);
 
-  /* Before reload, assuming all load/stores of valid addresses get compressed
-     gives better code size than checking if the address is reg + small_offset
-     early on.  */
-  if (result && !reload_completed)
-    return true;
-
   /* Return false if address is not compressed_reg + small_offset.  */
   if (!result
       || addr.type != ADDRESS_REG
-      || (!riscv_compressed_reg_p (REGNO (addr.reg))
-	    && addr.reg != stack_pointer_rtx)
+      /* Before reload, assume all registers are OK.  */
+      || (reload_completed
+	  && !riscv_compressed_reg_p (REGNO (addr.reg))
+	  && addr.reg != stack_pointer_rtx)
       || !riscv_compressed_lw_offset_p (addr.offset))
     return false;
 
@@ -1075,6 +1071,15 @@ static rtx
 riscv_force_binary (machine_mode mode, enum rtx_code code, rtx x, rtx y)
 {
   return riscv_emit_binary (code, gen_reg_rtx (mode), x, y);
+}
+
+static rtx
+riscv_swap_instruction (rtx inst)
+{
+  gcc_assert (GET_MODE (inst) == SImode);
+  if (BYTES_BIG_ENDIAN)
+    inst = expand_unop (SImode, bswap_optab, inst, gen_reg_rtx (SImode), 1);
+  return inst;
 }
 
 /* Copy VALUE to a register and return that register.  If new pseudos
@@ -1528,6 +1533,28 @@ riscv_legitimize_const_move (machine_mode mode, rtx dest, rtx src)
 bool
 riscv_legitimize_move (machine_mode mode, rtx dest, rtx src)
 {
+  /* Expand 
+       (set (reg:QI target) (mem:QI (address))) 
+     to
+       (set (reg:DI temp) (zero_extend:DI (mem:QI (address))))
+       (set (reg:QI target) (subreg:QI (reg:DI temp) 0))
+     with auto-sign/zero extend.  */
+  if (GET_MODE_CLASS (mode) == MODE_INT
+      && GET_MODE_SIZE (mode) < UNITS_PER_WORD
+      && can_create_pseudo_p ()
+      && MEM_P (src))
+    {
+      rtx temp_reg;
+      int zero_extend_p;
+
+      temp_reg = gen_reg_rtx (word_mode);
+      zero_extend_p = (LOAD_EXTEND_OP (mode) == ZERO_EXTEND);
+      emit_insn (gen_extend_insn (temp_reg, src, word_mode, mode, 
+				  zero_extend_p));
+      riscv_emit_move (dest, gen_lowpart (mode, temp_reg));
+      return true;
+    }
+
   if (!register_operand (dest, mode) && !reg_or_0_operand (src, mode))
     {
       rtx reg;
@@ -1708,6 +1735,13 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
 	 instructions it needs.  */
       if ((cost = riscv_address_insns (XEXP (x, 0), mode, true)) > 0)
 	{
+	  /* When optimizing for size, make uncompressible 32-bit addresses
+	     more expensive so that compressible 32-bit addresses are
+	     preferred.  */
+	  if (TARGET_RVC && !speed && riscv_mshorten_memrefs && mode == SImode
+	      && !riscv_compressed_lw_address_p (XEXP (x, 0)))
+	    cost++;
+
 	  *total = COSTS_N_INSNS (cost + tune_param->memory_cost);
 	  return true;
 	}
@@ -1932,7 +1966,7 @@ riscv_address_cost (rtx addr, machine_mode mode,
 rtx
 riscv_subword (rtx op, bool high_p)
 {
-  unsigned int byte = high_p ? UNITS_PER_WORD : 0;
+  unsigned int byte = (high_p != BYTES_BIG_ENDIAN) ? UNITS_PER_WORD : 0;
   machine_mode mode = GET_MODE (op);
 
   if (mode == VOIDmode)
@@ -3124,7 +3158,7 @@ riscv_legitimize_call_address (rtx addr)
 {
   if (!call_insn_operand (addr, VOIDmode))
     {
-      rtx reg = RISCV_PROLOGUE_TEMP (Pmode);
+      rtx reg = RISCV_CALL_ADDRESS_TEMP (Pmode);
       riscv_emit_move (reg, addr);
       return reg;
     }
@@ -3723,18 +3757,18 @@ riscv_compute_frame_info (void)
 {
   struct riscv_frame_info *frame;
   HOST_WIDE_INT offset;
-  bool interrupt_save_t1 = false;
+  bool interrupt_save_prologue_temp = false;
   unsigned int regno, i, num_x_saved = 0, num_f_saved = 0;
 
   frame = &cfun->machine->frame;
 
   /* In an interrupt function, if we have a large frame, then we need to
-     save/restore t1.  We check for this before clearing the frame struct.  */
+     save/restore t0.  We check for this before clearing the frame struct.  */
   if (cfun->machine->interrupt_handler_p)
     {
       HOST_WIDE_INT step1 = riscv_first_stack_step (frame);
       if (! SMALL_OPERAND (frame->total_size - step1))
-	interrupt_save_t1 = true;
+	interrupt_save_prologue_temp = true;
     }
 
   memset (frame, 0, sizeof (*frame));
@@ -3744,7 +3778,8 @@ riscv_compute_frame_info (void)
       /* Find out which GPRs we need to save.  */
       for (regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
 	if (riscv_save_reg_p (regno)
-	    || (interrupt_save_t1 && (regno == T1_REGNUM)))
+	    || (interrupt_save_prologue_temp
+		&& (regno == RISCV_PROLOGUE_TEMP_REGNUM)))
 	  frame->mask |= 1 << (regno - GP_REG_FIRST), num_x_saved++;
 
       /* If this function calls eh_return, we must also save and restore the
@@ -4806,6 +4841,53 @@ riscv_option_override (void)
 	   " [%<-mriscv-attribute%>]");
 #endif
 
+  if (riscv_stack_protector_guard == SSP_GLOBAL
+      && global_options_set.x_riscv_stack_protector_guard_offset_str)
+    {
+      error ("incompatible options %<-mstack-protector-guard=global%> and "
+	     "%<-mstack-protector-guard-offset=%s%>",
+	     riscv_stack_protector_guard_offset_str);
+    }
+
+  if (riscv_stack_protector_guard == SSP_TLS
+      && !(global_options_set.x_riscv_stack_protector_guard_offset_str
+	   && global_options_set.x_riscv_stack_protector_guard_reg_str))
+    {
+      error ("both %<-mstack-protector-guard-offset%> and "
+	     "%<-mstack-protector-guard-reg%> must be used "
+	     "with %<-mstack-protector-guard=sysreg%>");
+    }
+
+  if (global_options_set.x_riscv_stack_protector_guard_reg_str)
+    {
+      const char *str = riscv_stack_protector_guard_reg_str;
+      int reg = decode_reg_name (str);
+
+      if (!IN_RANGE (reg, GP_REG_FIRST + 1, GP_REG_LAST))
+	error ("%qs is not a valid base register in %qs", str,
+	       "-mstack-protector-guard-reg=");
+
+      riscv_stack_protector_guard_reg = reg;
+    }
+
+  if (global_options_set.x_riscv_stack_protector_guard_offset_str)
+    {
+      char *end;
+      const char *str = riscv_stack_protector_guard_offset_str;
+      errno = 0;
+      long offs = strtol (riscv_stack_protector_guard_offset_str, &end, 0);
+
+      if (!*str || *end || errno)
+	error ("%qs is not a valid number in %qs", str,
+	       "-mstack-protector-guard-offset=");
+
+      if (!SMALL_OPERAND (offs))
+	error ("%qs is not a valid offset in %qs", str,
+	       "-mstack-protector-guard-offset=");
+
+      riscv_stack_protector_guard_offset = offs;
+    }
+
 }
 
 /* Implement TARGET_CONDITIONAL_REGISTER_USAGE.  */
@@ -4879,9 +4961,9 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 
       rtx target_function = force_reg (Pmode, XEXP (DECL_RTL (fndecl), 0));
       /* lui     t2, hi(chain)
-	 lui     t1, hi(func)
+	 lui     t0, hi(func)
 	 addi    t2, t2, lo(chain)
-	 jr      r1, lo(func)
+	 jr      t0, lo(func)
       */
       unsigned HOST_WIDE_INT lui_hi_chain_code, lui_hi_func_code;
       unsigned HOST_WIDE_INT lo_chain_code, lo_func_code;
@@ -4904,9 +4986,9 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 					     gen_int_mode (lui_hi_chain_code, SImode));
 
       mem = adjust_address (m_tramp, SImode, 0);
-      riscv_emit_move (mem, lui_hi_chain);
+      riscv_emit_move (mem, riscv_swap_instruction (lui_hi_chain));
 
-      /* Gen lui t1, hi(func).  */
+      /* Gen lui t0, hi(func).  */
       rtx hi_func = riscv_force_binary (SImode, PLUS, target_function,
 					fixup_value);
       hi_func = riscv_force_binary (SImode, AND, hi_func,
@@ -4916,7 +4998,7 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 					    gen_int_mode (lui_hi_func_code, SImode));
 
       mem = adjust_address (m_tramp, SImode, 1 * GET_MODE_SIZE (SImode));
-      riscv_emit_move (mem, lui_hi_func);
+      riscv_emit_move (mem, riscv_swap_instruction (lui_hi_func));
 
       /* Gen addi t2, t2, lo(chain).  */
       rtx lo_chain = riscv_force_binary (SImode, AND, chain_value,
@@ -4931,9 +5013,9 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 					      force_reg (SImode, GEN_INT (lo_chain_code)));
 
       mem = adjust_address (m_tramp, SImode, 2 * GET_MODE_SIZE (SImode));
-      riscv_emit_move (mem, addi_lo_chain);
+      riscv_emit_move (mem, riscv_swap_instruction (addi_lo_chain));
 
-      /* Gen jr r1, lo(func).  */
+      /* Gen jr t0, lo(func).  */
       rtx lo_func = riscv_force_binary (SImode, AND, target_function,
 					imm12_mask);
       lo_func = riscv_force_binary (SImode, ASHIFT, lo_func, GEN_INT (20));
@@ -4944,7 +5026,7 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 					   force_reg (SImode, GEN_INT (lo_func_code)));
 
       mem = adjust_address (m_tramp, SImode, 3 * GET_MODE_SIZE (SImode));
-      riscv_emit_move (mem, jr_lo_func);
+      riscv_emit_move (mem, riscv_swap_instruction (jr_lo_func));
     }
   else
     {
@@ -4952,9 +5034,9 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
       target_function_offset = static_chain_offset + GET_MODE_SIZE (ptr_mode);
 
       /* auipc   t2, 0
-	 l[wd]   t1, target_function_offset(t2)
+	 l[wd]   t0, target_function_offset(t2)
 	 l[wd]   t2, static_chain_offset(t2)
-	 jr      t1
+	 jr      t0
       */
       trampoline[0] = OPCODE_AUIPC | (STATIC_CHAIN_REGNUM << SHIFT_RD);
       trampoline[1] = (Pmode == DImode ? OPCODE_LD : OPCODE_LW)
@@ -4970,6 +5052,8 @@ riscv_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
       /* Copy the trampoline code.  */
       for (i = 0; i < ARRAY_SIZE (trampoline); i++)
 	{
+	  if (BYTES_BIG_ENDIAN)
+	    trampoline[i] = __builtin_bswap32(trampoline[i]);
 	  mem = adjust_address (m_tramp, SImode, i * GET_MODE_SIZE (SImode));
 	  riscv_emit_move (mem, gen_int_mode (trampoline[i], SImode));
 	}
@@ -5189,6 +5273,18 @@ riscv_hard_regno_rename_ok (unsigned from_regno ATTRIBUTE_UNUSED,
   return !cfun->machine->interrupt_handler_p || df_regs_ever_live_p (to_regno);
 }
 
+/* Implement TARGET_NEW_ADDRESS_PROFITABLE_P.  */
+
+bool
+riscv_new_address_profitable_p (rtx memref, rtx_insn *insn, rtx new_addr)
+{
+  /* Prefer old address if it is less expensive.  */
+  addr_space_t as = MEM_ADDR_SPACE (memref);
+  bool speed = optimize_bb_for_speed_p (BLOCK_FOR_INSN (insn));
+  int old_cost = address_cost (XEXP (memref, 0), GET_MODE (memref), as, speed);
+  int new_cost = address_cost (new_addr, GET_MODE (memref), as, speed);
+  return new_cost <= old_cost;
+}
 
 /* Helper function for generating gpr_save pattern.  */
 
@@ -5296,6 +5392,19 @@ bool
 riscv_vector_mode_supported_p (enum machine_mode mode)
 {
   return TARGET_ZPN && riscv_rvp_support_vector_mode_p (mode);
+}
+
+/* Implement TARGET_ASAN_SHADOW_OFFSET.  */
+
+static unsigned HOST_WIDE_INT
+riscv_asan_shadow_offset (void)
+{
+  /* We only have libsanitizer support for RV64 at present.
+
+     This number must match kRiscv*_ShadowOffset* in the file
+     libsanitizer/asan/asan_mapping.h which is currently 1<<29 for rv64,
+     even though 1<<36 makes more sense.  */
+  return TARGET_64BIT ? (HOST_WIDE_INT_1 << 29) : 0;
 }
 
 /* Initialize the GCC target structure.  */
@@ -5480,6 +5589,14 @@ riscv_vector_mode_supported_p (enum machine_mode mode)
 
 #undef TARGET_NEW_ADDRESS_PROFITABLE_P
 #define TARGET_NEW_ADDRESS_PROFITABLE_P riscv_new_address_profitable_p
+
+#undef TARGET_ASAN_SHADOW_OFFSET
+#define TARGET_ASAN_SHADOW_OFFSET riscv_asan_shadow_offset
+
+#ifdef TARGET_BIG_ENDIAN_DEFAULT
+#undef  TARGET_DEFAULT_TARGET_FLAGS
+#define TARGET_DEFAULT_TARGET_FLAGS (MASK_BIG_ENDIAN)
+#endif
 
 /* rvp */
 #undef TARGET_VECTOR_MODE_SUPPORTED_P
