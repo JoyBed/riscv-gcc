@@ -5273,19 +5273,6 @@ riscv_hard_regno_rename_ok (unsigned from_regno ATTRIBUTE_UNUSED,
   return !cfun->machine->interrupt_handler_p || df_regs_ever_live_p (to_regno);
 }
 
-/* Implement TARGET_NEW_ADDRESS_PROFITABLE_P.  */
-
-bool
-riscv_new_address_profitable_p (rtx memref, rtx_insn *insn, rtx new_addr)
-{
-  /* Prefer old address if it is less expensive.  */
-  addr_space_t as = MEM_ADDR_SPACE (memref);
-  bool speed = optimize_bb_for_speed_p (BLOCK_FOR_INSN (insn));
-  int old_cost = address_cost (XEXP (memref, 0), GET_MODE (memref), as, speed);
-  int new_cost = address_cost (new_addr, GET_MODE (memref), as, speed);
-  return new_cost <= old_cost;
-}
-
 /* Helper function for generating gpr_save pattern.  */
 
 rtx
